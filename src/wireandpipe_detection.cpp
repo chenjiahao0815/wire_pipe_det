@@ -128,21 +128,16 @@ public:
         }
 
         // 解析 YOLOv11 OBB 输出: [1, D, N] 或转置形式 [1, N, D]
-        // D = channels_per_det (6 + nc per-class 模式) 或 7 (single class logit 模式)
-        // const int channels_per_class = 6 + num_classes_;  // unused, 8 for nc=2
         int rows = static_cast<int>(output_shape[1]);   // D or N
         int cols = static_cast<int>(output_shape[2]);   // N or D
 
         // 通道顺序: [cx, cy, w, h, cls0, cls1, angle]
-        // cls 已经 sigmoid 后，直接比较；angle 在最后一列
-        // 如果 shape 是 [1, D, N]，需要转置为 [N, D]
         bool need_transpose = (rows <= 20 && cols > rows && rows != 1);
         cv::Mat det;
         if (need_transpose) {
             cv::Mat raw(rows, cols, CV_32F, output_data);
             cv::transpose(raw, det);  // det shape: [N, D]
         } else if (cols <= 20 && rows > cols && cols != 1) {
-            // shape 已经是 [1, N, D]，直接取 [N, D]
             det = cv::Mat(rows, cols, CV_32F, output_data).clone();
         } else {
             RCLCPP_WARN_THROTTLE(logger_, steady_clock_, 2000,
@@ -158,19 +153,17 @@ public:
         const int det_channels = det.cols;
         if (det_channels < 6) return tracks;
 
-        std::vector<cv::Rect> boxes;          // 轴对齐外接矩形用于 NMS (cv::Rect = Rect_<int>)
+        std::vector<cv::Rect> boxes;
         std::vector<float> confidences;
         std::vector<int> class_ids;
-        std::vector<ObbBBox> obb_boxes;      // OBB 原始信息
+        std::vector<ObbBBox> obb_boxes;
 
         for (int i = 0; i < num_detections; ++i) {
             const float *row = det.ptr<float>(i);
             if (!row) continue;
 
-            // 通道顺序: [cx, cy, w, h, cls0, cls1, angle]
-            // cls 已经是 sigmoid 后的值，直接比较即可
             const int class_offset = 4;
-            const int num_class_channels = det_channels - class_offset - 1;  // 最后一列是 angle
+            const int num_class_channels = det_channels - class_offset - 1;
 
             int best_class = -1;
             float best_score = 0.0F;
@@ -188,9 +181,8 @@ public:
             const float cy  = row[1] * y_scale;
             const float w   = row[2] * x_scale;
             const float h   = row[3] * y_scale;
-            const float angle = row[det_channels - 1];  // 最后一列是 angle
+            const float angle = row[det_channels - 1];
 
-            // 轴对齐外接矩形用于 NMS
             const float half_diag = std::sqrt(w * w + h * h) * 0.5F;
             cv::Rect aabbox(
                 static_cast<int>(cx - half_diag),
@@ -211,7 +203,7 @@ public:
             obb_boxes.push_back(obb);
         }
 
-        // NMS（用轴对齐外接矩形）
+        // NMS
         std::vector<int> indices;
         if (!boxes.empty()) {
             cv::dnn::NMSBoxes(boxes, confidences, 0.15F, 0.65F, indices);
@@ -284,12 +276,6 @@ WireAndPipeDetectionNode::WireAndPipeDetectionNode()
     this->declare_parameter<double>("pedestrian_distance_threshold", 1.0);
     this->declare_parameter<double>("avoid_hold_seconds", 3.0);
 
-    // 物理尺寸
-    this->declare_parameter<double>("wire_typical_width", 0.03);
-    this->declare_parameter<double>("wire_typical_height", 0.01);
-    this->declare_parameter<double>("water_pipe_typical_width", 0.04);
-    this->declare_parameter<double>("water_pipe_typical_height", 0.03);
-
     // 跳帧
     this->declare_parameter<int>("yolo_frame_skip", 1);
 
@@ -320,11 +306,6 @@ WireAndPipeDetectionNode::WireAndPipeDetectionNode()
     local_search_distance_ = this->get_parameter("local_search_distance").as_double();
     obstacle_distance_threshold_ = this->get_parameter("pedestrian_distance_threshold").as_double();
     avoid_hold_seconds_ = this->get_parameter("avoid_hold_seconds").as_double();
-
-    wire_typical_width_ = this->get_parameter("wire_typical_width").as_double();
-    wire_typical_height_ = this->get_parameter("wire_typical_height").as_double();
-    water_pipe_typical_width_ = this->get_parameter("water_pipe_typical_width").as_double();
-    water_pipe_typical_height_ = this->get_parameter("water_pipe_typical_height").as_double();
 
     yolo_frame_skip_ = this->get_parameter("yolo_frame_skip").as_int();
     publish_annotated_image_ = this->get_parameter("publish_annotated_image").as_bool();
@@ -429,49 +410,63 @@ cv::Mat WireAndPipeDetectionNode::decodeCompressedImage(
 }
 
 // ---------------------------------------------------------------------------
-// 利用相机内参 + 物体物理尺寸估算 camera 坐标系下的 3D 坐标
-// 参考 vehicle_information_tracker.py 的 estimate_distance 逻辑
+// 利用激光雷达测距 + 激光坐标系下3D定位
+// 和行人避让代码逻辑一致：OBB像素范围→角度→二分查找激光点→极坐标→笛卡尔坐标
 // ---------------------------------------------------------------------------
-geometry_msgs::msg::Point WireAndPipeDetectionNode::estimate3DFromObb(
-    const ObbBBox &obb, int class_id) const
+geometry_msgs::msg::Point WireAndPipeDetectionNode::estimate3DFromLaser(
+    const ObbBBox &obb,
+    int img_width,
+    float &out_dist_laser,
+    std::string &out_laser_frame_id) const
 {
-    // 获取典型物理尺寸
-    double real_width = 0.03;   // 默认
-    double real_height = 0.01;
-    if (class_id == wire_class_id_) {
-        real_width = wire_typical_width_;
-        real_height = wire_typical_height_;
-    } else if (class_id == water_pipe_class_id_) {
-        real_width = water_pipe_typical_width_;
-        real_height = water_pipe_typical_height_;
-    }
-    (void)real_width;
-
-    // 使用 OBB 的 height来估算距离
-    // distance = (real_size * img_height) / (2 * bbox_pixel_size * tan(v_fov / 2))
-    const double bbox_pixel_h = static_cast<double>(obb.height);
-    double distance = (real_height * static_cast<double>(camera_height_))
-                      / (2.0 * bbox_pixel_h * std::tan(v_fov_rad_ / 2.0));
-
-    // 距离下限保护
-    distance = std::max(distance, 0.1);
-
-    // 水平方向：根据 cx 计算偏离角
-    const double theta_x = (0.5 - static_cast<double>(obb.cx) / static_cast<double>(camera_width_))
-                           * h_fov_rad_;
-    const double x_cam = distance * std::cos(theta_x);
-    const double y_cam = distance * std::sin(theta_x);
-    const double z_cam = 0.0;  // 地平面近似
-
     geometry_msgs::msg::Point pt;
-    pt.x = x_cam;   // 前
-    pt.y = y_cam;   // 左
-    pt.z = z_cam;   // 上
+    pt.x = pt.y = pt.z = 0.0;
+    out_dist_laser = std::numeric_limits<float>::quiet_NaN();
+    out_laser_frame_id.clear();
+
+    if (!cached_laser_valid_ || cached_laser_cam_pts_.empty()) return pt;
+
+    // OBB AABB 的 x 范围 → 水平角度范围
+    const float theta_min = (0.5F - (obb.cx + obb.width * 0.5F) / static_cast<float>(img_width))
+                            * static_cast<float>(h_fov_rad_);
+    const float theta_max = (0.5F - (obb.cx - obb.width * 0.5F) / static_cast<float>(img_width))
+                            * static_cast<float>(h_fov_rad_);
+    const float lo = std::min(theta_min, theta_max);
+    const float hi = std::max(theta_min, theta_max);
+
+    // 二分查找角度范围内的激光点
+    auto it_lo = std::lower_bound(cached_laser_cam_pts_.begin(), cached_laser_cam_pts_.end(), lo,
+        [](const LaserCamPt &lp, float val) { return lp.cam_angle < val; });
+    auto it_hi = std::upper_bound(it_lo, cached_laser_cam_pts_.end(), hi,
+        [](float val, const LaserCamPt &lp) { return val < lp.cam_angle; });
+
+    // 取最近距离的激光点
+    float best_dist = std::numeric_limits<float>::max();
+    float best_r = 0.0F;
+    float best_theta_l = 0.0F;
+    for (auto it = it_lo; it != it_hi; ++it) {
+        const float dist = std::hypot(it->xc, it->yc);
+        if (dist > 0.15F && dist < best_dist) {
+            best_dist = dist;
+            best_r = it->r;
+            best_theta_l = it->theta_l;
+        }
+    }
+
+    if (best_dist >= std::numeric_limits<float>::max()) return pt;
+
+    // 激光极坐标 → 激光笛卡尔坐标（和行人避让代码一模一样）
+    pt.x = best_r * std::cos(best_theta_l);
+    pt.y = best_r * std::sin(best_theta_l);
+    pt.z = 0.0;
+
+    out_dist_laser = best_dist;
+    out_laser_frame_id = cached_laser_scan_->header.frame_id;
     return pt;
 }
 
 // ---------------------------------------------------------------------------
-// 图像回调：YOLO 推理 + 标注 + 距离估计
+// 图像回调：YOLO 推理 + 标注 + 激光测距定位
 // ---------------------------------------------------------------------------
 void WireAndPipeDetectionNode::imageCallback(
     const sensor_msgs::msg::CompressedImage::SharedPtr msg)
@@ -500,7 +495,6 @@ void WireAndPipeDetectionNode::imageCallback(
     }
 
     // ---- 激光雷达预处理（参考 avoiding_pedestrians.cpp 逻辑） ----
-    // 获取最新激光扫描
     sensor_msgs::msg::LaserScan::SharedPtr latest_scan;
     {
         std::lock_guard<std::mutex> lock(laser_queue_mutex_);
@@ -584,7 +578,6 @@ void WireAndPipeDetectionNode::imageCallback(
             }
         }
     } else {
-        // 检测到目标，重置状态允许下次丢失时再打印一次
         waiting_detect_log_printed_ = false;
         if (!first_obstacle_detected_logged_) {
             RCLCPP_INFO(this->get_logger(), "Wire/Water pipe detected for the first time");
@@ -597,26 +590,29 @@ void WireAndPipeDetectionNode::imageCallback(
     DetectionResult result;
     result.detected = false;
     result.stamp = msg->header.stamp;
-    result.camera_frame_id = this->get_parameter("rgb_camera_frame").as_string();
+    if (latest_scan) {
+        result.laser_frame_id = latest_scan->header.frame_id;
+        result.laser_stamp = latest_scan->header.stamp;
+    }
 
     for (const auto &det : tracks) {
         if (det.confidence < static_cast<float>(conf_threshold_)) continue;
 
-        // ---- 两种距离估算 ----
-        // 1) 相机内参 + 物理尺寸
-        geometry_msgs::msg::Point pt_cam = estimate3DFromObb(det.bbox, det.class_id);
-        const float dist_pinhole = std::hypot(pt_cam.x, pt_cam.y);
+        // 激光雷达测距 + 3D定位
+        float dist_laser = std::numeric_limits<float>::quiet_NaN();
+        std::string laser_frame_id;
+        geometry_msgs::msg::Point pt_laser = estimate3DFromLaser(
+            det.bbox, frame.cols, dist_laser, laser_frame_id);
 
-        // 2) 激光雷达测距（AABB 水平角度范围 + 最近激光点）
-        const float dist_laser = estimateDistanceFromLaser(det.bbox, frame.cols);
-
-        // 打印两种距离对比（2 秒一次，防刷屏）
+        // 打印距离（2 秒一次，防刷屏）
         RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-            "[distance] pinhole=%.2fm  laser=%.2fm",
-            dist_pinhole,
+            "[distance] laser=%.2fm",
             std::isfinite(dist_laser) ? dist_laser : -1.0f);
 
-        result.obstacles_camera.push_back(pt_cam);
+        result.obstacles_laser.push_back(pt_laser);
+        if (!result.laser_frame_id.empty() && !laser_frame_id.empty()) {
+            result.laser_frame_id = laser_frame_id;
+        }
         result.detected = true;
 
         // 绘制 OBB（简化：画轴对齐矩形 + 角度标注）
@@ -637,8 +633,11 @@ void WireAndPipeDetectionNode::imageCallback(
         line1 << cls_name << " conf:" << std::fixed << std::setprecision(2) << det.confidence;
 
         std::ostringstream line2;
-        line2 << "dist:" << std::fixed << std::setprecision(2)
-              << std::hypot(pt_cam.x, pt_cam.y) << "m";
+        if (std::isfinite(dist_laser)) {
+            line2 << "dist:" << std::fixed << std::setprecision(2) << dist_laser << "m";
+        } else {
+            line2 << "dist:N/A";
+        }
 
         std::ostringstream line3;
         line3 << "angle:" << std::fixed << std::setprecision(2)
@@ -658,14 +657,14 @@ void WireAndPipeDetectionNode::imageCallback(
                     font, font_scale, cv::Scalar(255, 165, 0), thickness);
     }
 
-    // 发布水管/电线 3D LINE_LIST 可视化（在 camera 坐标系）
+    // 发布水管/电线 3D LINE_LIST 可视化（在激光坐标系）
     if (pub_wire_pipe_3d_) {
         visualization_msgs::msg::MarkerArray wp_markers;
         int wp_id = 0;
 
         // DELETEALL per namespace
         visualization_msgs::msg::Marker del_wire;
-        del_wire.header.frame_id = result.camera_frame_id;
+        del_wire.header.frame_id = result.laser_frame_id;
         del_wire.header.stamp = msg->header.stamp;
         del_wire.ns = "wire_3d";
         del_wire.id = wp_id++;
@@ -673,7 +672,7 @@ void WireAndPipeDetectionNode::imageCallback(
         wp_markers.markers.push_back(del_wire);
 
         visualization_msgs::msg::Marker del_pipe;
-        del_pipe.header.frame_id = result.camera_frame_id;
+        del_pipe.header.frame_id = result.laser_frame_id;
         del_pipe.header.stamp = msg->header.stamp;
         del_pipe.ns = "water_pipe_3d";
         del_pipe.id = wp_id++;
@@ -686,21 +685,21 @@ void WireAndPipeDetectionNode::imageCallback(
         for (const auto &det : tracks) {
             if (det.confidence < static_cast<float>(conf_threshold_)) continue;
 
-            const geometry_msgs::msg::Point pt_cam = estimate3DFromObb(det.bbox, det.class_id);
-            const double distance = std::hypot(pt_cam.x, pt_cam.y);
-            (void)distance;
+            float dist_laser_tmp = std::numeric_limits<float>::quiet_NaN();
+            std::string laser_frame_id_tmp;
+            const geometry_msgs::msg::Point pt_laser = estimate3DFromLaser(
+                det.bbox, frame.cols, dist_laser_tmp, laser_frame_id_tmp);
             const double angle = static_cast<double>(det.bbox.angle);
 
-            // 方向向量：在相机坐标系 YZ 平面内
+            // 方向向量
             const double dir_y = -std::cos(angle);
             const double dir_z = -std::sin(angle);
 
-            // 物理半长 ~ 0.3m，仅用于可视化方向
             constexpr double viz_half_len = 0.30;
 
             geometry_msgs::msg::Point p1, p2;
-            p1.x = pt_cam.x; p1.y = pt_cam.y + dir_y * viz_half_len; p1.z = pt_cam.z + dir_z * viz_half_len;
-            p2.x = pt_cam.x; p2.y = pt_cam.y - dir_y * viz_half_len; p2.z = pt_cam.z - dir_z * viz_half_len;
+            p1.x = pt_laser.x; p1.y = pt_laser.y + dir_y * viz_half_len; p1.z = pt_laser.z + dir_z * viz_half_len;
+            p2.x = pt_laser.x; p2.y = pt_laser.y - dir_y * viz_half_len; p2.z = pt_laser.z - dir_z * viz_half_len;
 
             if (det.class_id == wire_class_id_) {
                 wire_pts.push_back(p1);
@@ -714,7 +713,7 @@ void WireAndPipeDetectionNode::imageCallback(
         // 发布电线 LINE_LIST（蓝色）
         if (!wire_pts.empty()) {
             visualization_msgs::msg::Marker wire_m;
-            wire_m.header.frame_id = result.camera_frame_id;
+            wire_m.header.frame_id = result.laser_frame_id;
             wire_m.header.stamp = msg->header.stamp;
             wire_m.ns = "wire_3d";
             wire_m.id = wp_id++;
@@ -729,7 +728,7 @@ void WireAndPipeDetectionNode::imageCallback(
         // 发布水管 LINE_LIST（绿色）
         if (!pipe_pts.empty()) {
             visualization_msgs::msg::Marker pipe_m;
-            pipe_m.header.frame_id = result.camera_frame_id;
+            pipe_m.header.frame_id = result.laser_frame_id;
             pipe_m.header.stamp = msg->header.stamp;
             pipe_m.ns = "water_pipe_3d";
             pipe_m.id = wp_id++;
@@ -826,7 +825,7 @@ void WireAndPipeDetectionNode::globalPlanCallback(const nav_msgs::msg::Path::Sha
         line.id = mid++;
         line.type = visualization_msgs::msg::Marker::LINE_STRIP;
         line.action = visualization_msgs::msg::Marker::ADD;
-        line.scale.x = 0.05;  // 线宽
+        line.scale.x = 0.05;
         line.color.r = 0.2F; line.color.g = 0.6F; line.color.b = 1.0F; line.color.a = 0.7F;
         line.points.reserve(msg->poses.size());
         for (const auto& ps : msg->poses) {
@@ -871,8 +870,8 @@ void WireAndPipeDetectionNode::localPosesCallback(const geometry_msgs::msg::Pose
         line.id = mid++;
         line.type = visualization_msgs::msg::Marker::LINE_STRIP;
         line.action = visualization_msgs::msg::Marker::ADD;
-        line.scale.x = 0.03;  // 线宽
-        line.color.r = 1.0F; line.color.g = 0.65F; line.color.b = 0.0F; line.color.a = 0.7F;  // 橙色
+        line.scale.x = 0.03;
+        line.color.r = 1.0F; line.color.g = 0.65F; line.color.b = 0.0F; line.color.a = 0.7F;
         line.points.reserve(msg->poses.size());
         for (const auto& ps : msg->poses) {
             line.points.push_back(ps.position);
@@ -978,24 +977,23 @@ void WireAndPipeDetectionNode::timerCallback()
             det = detection_result_;
         }
 
-        if (det.detected && !det.obstacles_camera.empty()) {
-            // 将 camera 坐标系下的障碍物转换到 map
-            const std::string rgb_camera_frame = det.camera_frame_id;
+        if (det.detected && !det.obstacles_laser.empty() && !det.laser_frame_id.empty()) {
+            // 将激光坐标系下的障碍物转换到 map
             std::vector<geometry_msgs::msg::PointStamped> obstacles_map;
-            obstacles_map.reserve(det.obstacles_camera.size());
+            obstacles_map.reserve(det.obstacles_laser.size());
 
-            for (const auto &pt_cam : det.obstacles_camera) {
+            for (const auto &pt_laser : det.obstacles_laser) {
                 geometry_msgs::msg::PointStamped p_in;
-                p_in.header.frame_id = rgb_camera_frame;
+                p_in.header.frame_id = det.laser_frame_id;
                 p_in.header.stamp = rclcpp::Time(0, 0, RCL_ROS_TIME);
-                p_in.point = pt_cam;
+                p_in.point = pt_laser;
                 try {
                     geometry_msgs::msg::PointStamped p_map;
                     tf_buffer_->transform(p_in, p_map, "map", tf2::durationFromSec(0.2));
                     obstacles_map.push_back(p_map);
                 } catch (const tf2::TransformException &e) {
                     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 500,
-                        "[TF] camera->map transform failed: %s", e.what());
+                        "[TF] laser->map transform failed: %s", e.what());
                 }
             }
 
@@ -1203,50 +1201,6 @@ bool WireAndPipeDetectionNode::checkObstacleOnLocalPath(
         last_local_match_ = false;
     }
     return false;
-}
-
-// =========================================================================
-// [METHOD 2] 激光雷达测距（AABB 水平角度范围 + 最近激光点）
-// 利用图像内已知的 h_fov，将 OBB 的 x 范围映射为水平角度范围，
-// 在 cached_laser_cam_pts_ 中二分查找落入该角度范围的激光点，取最近距离。
-// 返回距离（米），失败返回 NaN
-// =========================================================================
-float WireAndPipeDetectionNode::estimateDistanceFromLaser(
-    const ObbBBox &obb, int img_width) const
-{
-    if (!cached_laser_valid_ || cached_laser_cam_pts_.empty()) {
-        return std::numeric_limits<float>::quiet_NaN();
-    }
-
-    // AABB: x_min = cx - w/2,  x_max = cx + w/2
-    // 像素 x → 水平角度 θ = (0.5 - x / img_w) * h_fov
-    const float theta_min = (0.5F - (obb.cx + obb.width * 0.5F) / static_cast<float>(img_width))
-                            * static_cast<float>(h_fov_rad_);
-    const float theta_max = (0.5F - (obb.cx - obb.width * 0.5F) / static_cast<float>(img_width))
-                            * static_cast<float>(h_fov_rad_);
-
-    // 确保 theta_min <= theta_max（因为 x 越大 → θ 越小）
-    const float lo = std::min(theta_min, theta_max);
-    const float hi = std::max(theta_min, theta_max);
-
-    // 二分搜索
-    auto it_lo = std::lower_bound(cached_laser_cam_pts_.begin(), cached_laser_cam_pts_.end(), lo,
-        [](const LaserCamPt &lp, float val) { return lp.cam_angle < val; });
-    auto it_hi = std::upper_bound(it_lo, cached_laser_cam_pts_.end(), hi,
-        [](float val, const LaserCamPt &lp) { return val < lp.cam_angle; });
-
-    float best_dist = std::numeric_limits<float>::max();
-    for (auto it = it_lo; it != it_hi; ++it) {
-        const float dist = std::hypot(it->xc, it->yc);
-        if (dist > 0.15F && dist < best_dist) {
-            best_dist = dist;
-        }
-    }
-
-    if (best_dist >= std::numeric_limits<float>::max()) {
-        return std::numeric_limits<float>::quiet_NaN();
-    }
-    return best_dist;
 }
 
 // ---------------------------------------------------------------------------
