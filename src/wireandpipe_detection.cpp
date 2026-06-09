@@ -330,7 +330,7 @@ WireAndPipeDetectionNode::WireAndPipeDetectionNode()
     pub_avoiding_ = this->create_publisher<std_msgs::msg::Bool>(
         "/is_pipes_and_wires_in_path", qos_transient_local);
     pub_annotated_image_ = this->create_publisher<sensor_msgs::msg::Image>(
-        "/rgb_camera_front/annotated_image", 10);
+        "/rgb_camera_front/annotated_image_wire", 10);
     pub_obstacle_markers_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
         "/obstacles/map_markers", 10);
     pub_downsampled_path_markers_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
