@@ -59,10 +59,11 @@ private:
     {
         bool detected{false};
         builtin_interfaces::msg::Time stamp;
-        // 障碍物在 camera 坐标系内的 3D 估算坐标
-        // x=前, y=左, z=上
-        std::vector<geometry_msgs::msg::Point> obstacles_camera;
-        std::string camera_frame_id;
+        // 障碍物在 laser 坐标系内的 3D 坐标
+        // x, y 由激光极坐标转换, z=0
+        std::vector<geometry_msgs::msg::Point> obstacles_laser;
+        std::string laser_frame_id;
+        builtin_interfaces::msg::Time laser_stamp;
     };
 
     // ---- 回调 ----
@@ -95,18 +96,15 @@ private:
         double *hit_distance = nullptr);
 
     // =========================================================================
-    // [METHOD 1] 相机内参 + 物理尺寸估算距离（pinhole 模型）
-    // 返回 camera 坐标系下的 3D 坐标 (x=前, y=左, z=上)
+    // 激光雷达测距 + 3D定位
+    // OBB 像素范围 → 水平角度 → 二分查找激光点 → 极坐标转笛卡尔坐标
+    // 返回激光坐标系下的 3D 点，同时输出距离和 laser frame_id
     // =========================================================================
-    geometry_msgs::msg::Point estimate3DFromObb(
-        const ObbBBox &obb, int class_id) const;
-
-    // =========================================================================
-    // [METHOD 2] 激光雷达测距（AABB 水平角度范围 + 最近激光点）
-    // 返回距离（米），失败返回 NaN
-    // =========================================================================
-    float estimateDistanceFromLaser(
-        const ObbBBox &obb, int img_width) const;
+    geometry_msgs::msg::Point estimate3DFromLaser(
+        const ObbBBox &obb,
+        int img_width,
+        float &out_dist_laser,
+        std::string &out_laser_frame_id) const;
 
     void laserCallback(const sensor_msgs::msg::LaserScan::SharedPtr msg);
 
@@ -173,12 +171,6 @@ private:
     double obstacle_distance_threshold_{1.0};
     double avoid_hold_seconds_{3.0};
 
-    // 物理尺寸
-    double wire_typical_width_{0.03};
-    double wire_typical_height_{0.01};
-    double water_pipe_typical_width_{0.04};
-    double water_pipe_typical_height_{0.03};
-
     // 跳帧
     int yolo_frame_skip_{1};
 
@@ -209,7 +201,7 @@ private:
     std::mutex laser_queue_mutex_;
     static constexpr size_t laser_queue_max_size_{10};
 
-    // 激光测距用的缓存（在 imageCallback 中计算，供 estimateDistanceFromLaser 使用）
+    // 激光测距用的缓存（在 imageCallback 中计算，供 estimate3DFromLaser 使用）
     struct LaserCamPt {
         float xc;         // 相机系 X（前）
         float yc;         // 相机系 Y（左）
