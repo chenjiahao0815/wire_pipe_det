@@ -40,7 +40,8 @@ public:
     OrtObbYoloTracker(const std::string &model_path,
                       const rclcpp::Logger &logger,
                       int num_classes = 2)
-        : logger_(logger), env_(ORT_LOGGING_LEVEL_WARNING, "yolo_obb"), num_classes_(num_classes)
+        : logger_(logger), steady_clock_(RCL_SYSTEM_TIME),
+          env_(ORT_LOGGING_LEVEL_WARNING, "yolo_obb"), num_classes_(num_classes)
     {
         try {
             Ort::SessionOptions session_options;
@@ -128,17 +129,12 @@ public:
 
         // 解析 YOLOv11 OBB 输出: [1, D, N] 或转置形式 [1, N, D]
         // D = channels_per_det (6 + nc per-class 模式) 或 7 (single class logit 模式)
-        const int channels_per_class = 6 + num_classes_;  // 8 for nc=2
+        // const int channels_per_class = 6 + num_classes_;  // unused, 8 for nc=2
         int rows = static_cast<int>(output_shape[1]);   // D or N
         int cols = static_cast<int>(output_shape[2]);   // N or D
 
-        // 自动检测模式:
-        //   - 若 D==8 → per-class scores 模式 (class_0, class_1 在 index 5,6)
-        //   - 若 D==7 → single class logit 模式 (cls_logit 在 index 6)
-        const int channels_per_det = static_cast<int>(output_shape[1]);
-        const bool use_single_class_mode = (channels_per_det == 7);  // ultralytics 默认导出
-        const bool use_per_class_mode   = (channels_per_det == 6 + num_classes_);
-
+        // 通道顺序: [cx, cy, w, h, cls0, cls1, angle]
+        // cls 已经 sigmoid 后，直接比较；angle 在最后一列
         // 如果 shape 是 [1, D, N]，需要转置为 [N, D]
         bool need_transpose = (rows <= 20 && cols > rows && rows != 1);
         cv::Mat det;
@@ -149,16 +145,9 @@ public:
             // shape 已经是 [1, N, D]，直接取 [N, D]
             det = cv::Mat(rows, cols, CV_32F, output_data).clone();
         } else {
-            RCLCPP_WARN_THROTTLE(logger_, rclcpp::Clock(RCL_SYSTEM_TIME), 2000,
+            RCLCPP_WARN_THROTTLE(logger_, steady_clock_, 2000,
                 "[OBB YOLO] Unexpected output shape: [%ld,%ld,%ld], cannot determine D/N",
                 (long)output_shape[0], (long)output_shape[1], (long)output_shape[2]);
-            return tracks;
-        }
-
-        if (!use_single_class_mode && !use_per_class_mode) {
-            RCLCPP_WARN_THROTTLE(logger_, rclcpp::Clock(RCL_SYSTEM_TIME), 2000,
-                "[OBB YOLO] Unexpected channels_per_det=%d, expected 7 or %d",
-                channels_per_det, 6 + num_classes_);
             return tracks;
         }
 
@@ -169,7 +158,7 @@ public:
         const int det_channels = det.cols;
         if (det_channels < 6) return tracks;
 
-        std::vector<cv::Rect2f> boxes;       // 轴对齐外接矩形用于 NMS
+        std::vector<cv::Rect> boxes;          // 轴对齐外接矩形用于 NMS (cv::Rect = Rect_<int>)
         std::vector<float> confidences;
         std::vector<int> class_ids;
         std::vector<ObbBBox> obb_boxes;      // OBB 原始信息
@@ -178,34 +167,18 @@ public:
             const float *row = det.ptr<float>(i);
             if (!row) continue;
 
+            // 通道顺序: [cx, cy, w, h, cls0, cls1, angle]
+            // cls 已经是 sigmoid 后的值，直接比较即可
+            const int class_offset = 4;
+            const int num_class_channels = det_channels - class_offset - 1;  // 最后一列是 angle
+
             int best_class = -1;
             float best_score = 0.0F;
-
-            if (use_single_class_mode) {
-                // 7列模式: col[5]=obj_conf, col[6]=cls_logit
-                // 类别: sigmoid(cls_logit) < 0.5 → class 0 (wire), >= 0.5 → class 1 (water_pipe)
-                const float obj_conf = row[5];
-                const float cls_logit = row[6];
-                // sigmoid 近似 (clamped to avoid overflow)
-                float sigmoid_val;
-                if (cls_logit >= 0) {
-                    sigmoid_val = 1.0F / (1.0F + std::exp(-cls_logit));
-                } else {
-                    const float exp_val = std::exp(cls_logit);
-                    sigmoid_val = exp_val / (1.0F + exp_val);
-                }
-                best_class = (sigmoid_val >= 0.5F) ? 1 : 0;
-                best_score = obj_conf;  // 使用 obj_conf 作为置信度
-            } else {
-                // 8列模式: col[5]=obj_conf, col[6]=class_0_score, col[7]=class_1_score
-                const int class_offset = 5;
-                const int num_classes = det_channels - class_offset;
-                for (int c = 0; c < num_classes; ++c) {
-                    const float score = row[class_offset + c];
-                    if (score > best_score) {
-                        best_score = score;
-                        best_class = c;
-                    }
+            for (int c = 0; c < num_class_channels; ++c) {
+                const float score = row[class_offset + c];
+                if (score > best_score) {
+                    best_score = score;
+                    best_class = c;
                 }
             }
 
@@ -215,11 +188,15 @@ public:
             const float cy  = row[1] * y_scale;
             const float w   = row[2] * x_scale;
             const float h   = row[3] * y_scale;
-            const float angle = row[4];  // 弧度（YOLOv11 OBB 默认弧度）
+            const float angle = row[det_channels - 1];  // 最后一列是 angle
 
             // 轴对齐外接矩形用于 NMS
             const float half_diag = std::sqrt(w * w + h * h) * 0.5F;
-            cv::Rect2f aabbox(cx - half_diag, cy - half_diag, half_diag * 2.0F, half_diag * 2.0F);
+            cv::Rect aabbox(
+                static_cast<int>(cx - half_diag),
+                static_cast<int>(cy - half_diag),
+                static_cast<int>(half_diag * 2.0F),
+                static_cast<int>(half_diag * 2.0F));
 
             boxes.push_back(aabbox);
             confidences.push_back(best_score);
@@ -254,6 +231,7 @@ public:
 
 private:
     rclcpp::Logger logger_;
+    rclcpp::Clock steady_clock_;
     Ort::Env env_;
     std::unique_ptr<Ort::Session> session_;
     Ort::AllocatorWithDefaultOptions allocator_;
@@ -379,7 +357,7 @@ WireAndPipeDetectionNode::WireAndPipeDetectionNode()
     pub_raw_path_markers_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
         "/raw_path/markers", 10);
     pub_wire_pipe_3d_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
-        "/wire_pipe/3d_markers", 10);
+        "/wire_pipe/markers_3d", 10);
 
     // ---- 订阅者 ----
     const std::string camera_topic = this->get_parameter("camera_topic").as_string();
@@ -467,6 +445,7 @@ geometry_msgs::msg::Point WireAndPipeDetectionNode::estimate3DFromObb(
         real_width = water_pipe_typical_width_;
         real_height = water_pipe_typical_height_;
     }
+    (void)real_width;
 
     // 使用 OBB 的 height来估算距离
     // distance = (real_size * img_height) / (2 * bbox_pixel_size * tan(v_fov / 2))
@@ -709,6 +688,7 @@ void WireAndPipeDetectionNode::imageCallback(
 
             const geometry_msgs::msg::Point pt_cam = estimate3DFromObb(det.bbox, det.class_id);
             const double distance = std::hypot(pt_cam.x, pt_cam.y);
+            (void)distance;
             const double angle = static_cast<double>(det.bbox.angle);
 
             // 方向向量：在相机坐标系 YZ 平面内
@@ -1270,7 +1250,7 @@ float WireAndPipeDetectionNode::estimateDistanceFromLaser(
 }
 
 // ---------------------------------------------------------------------------
-// 激光雷达回调（缓存最新扫描到队列中）
+// 激光雷达回调
 // ---------------------------------------------------------------------------
 void WireAndPipeDetectionNode::laserCallback(
     const sensor_msgs::msg::LaserScan::SharedPtr msg)
