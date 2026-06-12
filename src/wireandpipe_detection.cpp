@@ -384,6 +384,12 @@ WireAndPipeDetectionNode::WireAndPipeDetectionNode()
     // ---- Timer  ----
     timer_ = this->create_wall_timer(100ms, [this]() { this->timerCallback(); });
 
+    // 节点启动时主动发布 false，确保下游状态确定
+    auto init_avoiding_msg = std_msgs::msg::Bool();
+    init_avoiding_msg.data = false;
+    pub_avoiding_->publish(init_avoiding_msg);
+    last_published_avoiding_ = false;
+
     RCLCPP_INFO(this->get_logger(), "WireAndPipeDetectionNode initialized");
     RCLCPP_INFO(this->get_logger(), "  Camera: %s", camera_topic.c_str());
     RCLCPP_INFO(this->get_logger(), "  Laser: %s", scan_topic.c_str());

@@ -4,7 +4,7 @@
     camera_topic: "/rgb_camera_front/compressed"
     rgb_camera_frame: "front_camera_color_frame"
 
-    # 相机内参（默认值，运行时可通过参数覆盖）
+    # 相机内参
     fx: 640.0
     fy: 640.0
     cx: 640.0
@@ -17,8 +17,8 @@
     # 相机外参
     camera_x: 0.0
     camera_y: 0.0
-    camera_z: 1.0              # 相机安装高度（米）
-    camera_pitch: 0.0          # 俯仰角（弧度），正值为向下
+    camera_z: 1.0              # 相机安装高度
+    camera_pitch: 0.0          # 俯仰角，正值为向下
     camera_yaw: 0.0
     camera_roll: 0.0
 
@@ -55,10 +55,10 @@
     # --- 水管/电线物理尺寸   用于单目距离估计 ---
     # 水管的典型物理尺寸   米，用于 pinhole 距离估算
     # 保洁用软管：直径约 0.02~0.05m，长度不定
-    wire_typical_width: 0.03     # 电线典型宽度（米）
-    wire_typical_height: 0.01    # 电线典型高度（米），较细
-    water_pipe_typical_width: 0.04   # 水管典型宽度（米），直径
-    water_pipe_typical_height: 0.03  # 水管典型高度（米）
+    wire_typical_width: 0.03     # 电线典型宽度
+    wire_typical_height: 0.01    # 电线典型高度，较细
+    water_pipe_typical_width: 0.04   # 水管典型宽度，直径
+    water_pipe_typical_height: 0.03  # 水管典型高度
 
     # --- YOLO 跳帧 ---
     yolo_frame_skip: 3           # 1 = 不跳帧
