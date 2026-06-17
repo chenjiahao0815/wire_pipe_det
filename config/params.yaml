@@ -69,3 +69,6 @@
     # --- 可视化 ---
     publish_annotated_image: true
     publish_debug_map_markers: true
+
+    # 地平线过滤：检测框全部在图像中线上方时视为天空误识别，直接忽略
+    filter_above_horizon: true

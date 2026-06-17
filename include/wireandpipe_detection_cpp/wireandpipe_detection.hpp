@@ -186,6 +186,9 @@ private:
     bool publish_annotated_image_{true};
     bool publish_debug_map_markers_{true};
 
+    // 地平线过滤：框全部在图像中线上方则认为是天空/误识别
+    bool filter_above_horizon_{true};
+
     // ---- 状态 ----
     bool has_recent_detection_{false};
     bool last_published_avoiding_{false};

@@ -330,6 +330,9 @@ WireAndPipeDetectionNode::WireAndPipeDetectionNode()
     this->declare_parameter<bool>("publish_annotated_image", true);
     this->declare_parameter<bool>("publish_debug_map_markers", true);
 
+    // 地平线过滤（框全在图像中线上方则视为误识别）
+    this->declare_parameter<bool>("filter_above_horizon", true);
+
     // ---- 读取参数 ----
     fx_ = this->get_parameter("fx").as_double();
     fy_ = this->get_parameter("fy").as_double();
@@ -370,6 +373,7 @@ WireAndPipeDetectionNode::WireAndPipeDetectionNode()
     yolo_frame_skip_ = this->get_parameter("yolo_frame_skip").as_int();
     publish_annotated_image_ = this->get_parameter("publish_annotated_image").as_bool();
     publish_debug_map_markers_ = this->get_parameter("publish_debug_map_markers").as_bool();
+    filter_above_horizon_ = this->get_parameter("filter_above_horizon").as_bool();
 
     // ---- 模型路径 ----
     std::string yolo_model_path = this->get_parameter("yolo_model_path").as_string();
@@ -669,6 +673,21 @@ void WireAndPipeDetectionNode::imageCallback(
 
     for (const auto &det : tracks) {
         if (det.confidence < static_cast<float>(conf_threshold_)) continue;
+
+        // 地平线过滤：如果 OBB 四个角点全在图像中线上方，认为是天空误识别，直接跳过
+        if (filter_above_horizon_) {
+            const float horizon_y = static_cast<float>(frame.rows) * 0.5F;
+            bool all_above = true;
+            for (const auto &corner : getObbCorners(det.bbox)) {
+                if (corner.y >= horizon_y) {
+                    all_above = false;
+                    break;
+                }
+            }
+            if (all_above) {
+                continue;  // 不发布、不可视化、不进入检测结果
+            }
+        }
 
         // 激光雷达测距 + 3D定位
         float dist_laser = std::numeric_limits<float>::quiet_NaN();
