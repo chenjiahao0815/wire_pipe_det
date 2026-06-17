@@ -17,12 +17,44 @@
 #include <opencv2/dnn.hpp>
 #include <opencv2/imgproc.hpp>
 #include <algorithm>
+#include <numeric>
 #include <sstream>
 
 using namespace std::chrono_literals;
 
 namespace
 {
+// ---- OBB 辅助函数：计算旋转矩形四个角点 ----
+static std::vector<cv::Point2f> getObbCorners(const ObbBBox &obb)
+{
+    std::vector<cv::Point2f> pts(4);
+    const float cx = obb.cx;
+    const float cy = obb.cy;
+    const float dx = obb.width * 0.5F;
+    const float dy = obb.height * 0.5F;
+    const float cos_a = std::cos(obb.angle);
+    const float sin_a = std::sin(obb.angle);
+
+    // 局部坐标 (±dx, ±dy) 绕中心旋转
+    const float lx[4] = {-dx,  dx,  dx, -dx};
+    const float ly[4] = {-dy, -dy,  dy,  dy};
+    for (int i = 0; i < 4; ++i) {
+        pts[i].x = cx + lx[i] * cos_a - ly[i] * sin_a;
+        pts[i].y = cy + lx[i] * sin_a + ly[i] * cos_a;
+    }
+    return pts;
+}
+
+// ---- OBB 辅助函数：两个旋转矩形的 IoU ----
+static float obbIoU(const ObbBBox &a, const ObbBBox &b)
+{
+    std::vector<cv::Point2f> inter;
+    cv::intersectConvexConvex(getObbCorners(a), getObbCorners(b), inter, true);
+    const float inter_area = inter.empty() ? 0.0F : static_cast<float>(cv::contourArea(inter));
+    const float union_area = (a.width * a.height) + (b.width * b.height) - inter_area;
+    return union_area > 0.0F ? inter_area / union_area : 0.0F;
+}
+
 // =============================================================================
 // OrtObbYoloTracker: ONNX Runtime OBB YOLO tracker
 // YOLOv11 OBB 导出 ONNX 的输出格式支持两种:
@@ -38,10 +70,9 @@ class OrtObbYoloTracker : public ObbYoloTracker
 {
 public:
     OrtObbYoloTracker(const std::string &model_path,
-                      const rclcpp::Logger &logger,
-                      int num_classes = 2)
+                      const rclcpp::Logger &logger)
         : logger_(logger), steady_clock_(RCL_SYSTEM_TIME),
-          env_(ORT_LOGGING_LEVEL_WARNING, "yolo_obb"), num_classes_(num_classes)
+          env_(ORT_LOGGING_LEVEL_WARNING, "yolo_obb")
     {
         try {
             Ort::SessionOptions session_options;
@@ -75,8 +106,23 @@ public:
         if (!yolo_enabled_ || frame.empty()) return tracks;
 
         constexpr int input_size = 640;
+
+        // ---- 与 ultralytics 一致的 letterbox 预处理 ----
+        const float scale_x = static_cast<float>(input_size) / static_cast<float>(frame.cols);
+        const float scale_y = static_cast<float>(input_size) / static_cast<float>(frame.rows);
+        const float scale = std::min(scale_x, scale_y);
+        const int new_w = static_cast<int>(std::round(frame.cols * scale));
+        const int new_h = static_cast<int>(std::round(frame.rows * scale));
+        const int pad_left = (input_size - new_w) / 2;
+        const int pad_top  = (input_size - new_h) / 2;
+
+        cv::Mat resized;
+        cv::resize(frame, resized, cv::Size(new_w, new_h), 0, 0, cv::INTER_LINEAR);
+        cv::Mat letterboxed(input_size, input_size, CV_8UC3, cv::Scalar(114, 114, 114));
+        resized.copyTo(letterboxed(cv::Rect(pad_left, pad_top, new_w, new_h)));
+
         cv::Mat blob;
-        cv::dnn::blobFromImage(frame, blob, 1.0 / 255.0,
+        cv::dnn::blobFromImage(letterboxed, blob, 1.0 / 255.0,
                                cv::Size(input_size, input_size),
                                cv::Scalar(), true, false);
 
@@ -146,14 +192,12 @@ public:
             return tracks;
         }
 
-        const float x_scale = static_cast<float>(frame.cols) / static_cast<float>(input_size);
-        const float y_scale = static_cast<float>(frame.rows) / static_cast<float>(input_size);
+        // letterbox 的缩放是等比的，x/y 使用同一个 scale，并扣除 padding
 
         const int num_detections = det.rows;
         const int det_channels = det.cols;
         if (det_channels < 6) return tracks;
 
-        std::vector<cv::Rect> boxes;
         std::vector<float> confidences;
         std::vector<int> class_ids;
         std::vector<ObbBBox> obb_boxes;
@@ -177,36 +221,38 @@ public:
 
             if (best_score < 0.15F || best_class < 0) continue;
 
-            const float cx  = row[0] * x_scale;
-            const float cy  = row[1] * y_scale;
-            const float w   = row[2] * x_scale;
-            const float h   = row[3] * y_scale;
-            const float angle = row[det_channels - 1];
+            ObbBBox obb;
+            obb.cx     = (row[0] - static_cast<float>(pad_left)) / scale;
+            obb.cy     = (row[1] - static_cast<float>(pad_top)) / scale;
+            obb.width  = row[2] / scale;
+            obb.height = row[3] / scale;
+            obb.angle  = row[det_channels - 1];
 
-            const float half_diag = std::sqrt(w * w + h * h) * 0.5F;
-            cv::Rect aabbox(
-                static_cast<int>(cx - half_diag),
-                static_cast<int>(cy - half_diag),
-                static_cast<int>(half_diag * 2.0F),
-                static_cast<int>(half_diag * 2.0F));
-
-            boxes.push_back(aabbox);
             confidences.push_back(best_score);
             class_ids.push_back(best_class);
-
-            ObbBBox obb;
-            obb.cx = cx;
-            obb.cy = cy;
-            obb.width = w;
-            obb.height = h;
-            obb.angle = angle;
             obb_boxes.push_back(obb);
         }
 
-        // NMS
+        // 按置信度降序排序，准备做 OBB NMS
+        std::vector<int> order(confidences.size());
+        std::iota(order.begin(), order.end(), 0);
+        std::sort(order.begin(), order.end(),
+            [&](int a, int b) { return confidences[a] > confidences[b]; });
+
+        // OBB NMS
         std::vector<int> indices;
-        if (!boxes.empty()) {
-            cv::dnn::NMSBoxes(boxes, confidences, 0.15F, 0.65F, indices);
+        std::vector<bool> suppressed(obb_boxes.size(), false);
+        for (size_t i = 0; i < order.size(); ++i) {
+            const int idx = order[i];
+            if (suppressed[idx]) continue;
+            indices.push_back(idx);
+            for (size_t j = i + 1; j < order.size(); ++j) {
+                const int jdx = order[j];
+                if (suppressed[jdx]) continue;
+                if (obbIoU(obb_boxes[idx], obb_boxes[jdx]) > 0.65F) {
+                    suppressed[jdx] = true;
+                }
+            }
         }
 
         tracks.reserve(indices.size());
@@ -230,7 +276,6 @@ private:
     std::string input_name_;
     std::string output_name_;
     bool yolo_enabled_{false};
-    int num_classes_{2};
 };
 }  // namespace
 
@@ -262,9 +307,11 @@ WireAndPipeDetectionNode::WireAndPipeDetectionNode()
 
     // YOLO
     this->declare_parameter<std::string>("yolo_model_path", "");
+    this->declare_parameter<std::vector<std::string>>("class_names", std::vector<std::string>{"wire", "water_pipe"});
     this->declare_parameter<int>("wire_class_id", 0);
     this->declare_parameter<int>("water_pipe_class_id", 1);
     this->declare_parameter<double>("conf_threshold", 0.5);
+    this->declare_parameter<double>("distance_log_throttle_sec", 3.0);  // distance 日志最小间隔
 
     // 路径
     this->declare_parameter<std::string>("global_plan_topic", "teb_global_plan");
@@ -281,6 +328,7 @@ WireAndPipeDetectionNode::WireAndPipeDetectionNode()
 
     // 可视化
     this->declare_parameter<bool>("publish_annotated_image", true);
+    this->declare_parameter<bool>("publish_debug_map_markers", true);
 
     // ---- 读取参数 ----
     fx_ = this->get_parameter("fx").as_double();
@@ -298,9 +346,21 @@ WireAndPipeDetectionNode::WireAndPipeDetectionNode()
     camera_yaw_ = this->get_parameter("camera_yaw").as_double();
     camera_roll_ = this->get_parameter("camera_roll").as_double();
 
+    class_names_ = this->get_parameter("class_names").as_string_array();
     wire_class_id_ = this->get_parameter("wire_class_id").as_int();
     water_pipe_class_id_ = this->get_parameter("water_pipe_class_id").as_int();
     conf_threshold_ = this->get_parameter("conf_threshold").as_double();
+    distance_log_throttle_sec_ = this->get_parameter("distance_log_throttle_sec").as_double();
+
+    // 构造日志中使用的类别标签，如 "pipe" 或 "wire/water_pipe"
+    if (class_names_.empty()) {
+        detection_label_ = "obstacle";
+    } else {
+        detection_label_ = class_names_[0];
+        for (size_t i = 1; i < class_names_.size(); ++i) {
+            detection_label_ += "/" + class_names_[i];
+        }
+    }
 
     global_search_distance_ = this->get_parameter("global_search_distance").as_double();
     local_search_distance_ = this->get_parameter("local_search_distance").as_double();
@@ -309,14 +369,18 @@ WireAndPipeDetectionNode::WireAndPipeDetectionNode()
 
     yolo_frame_skip_ = this->get_parameter("yolo_frame_skip").as_int();
     publish_annotated_image_ = this->get_parameter("publish_annotated_image").as_bool();
+    publish_debug_map_markers_ = this->get_parameter("publish_debug_map_markers").as_bool();
 
     // ---- 模型路径 ----
     std::string yolo_model_path = this->get_parameter("yolo_model_path").as_string();
+    const std::string pkg_share = ament_index_cpp::get_package_share_directory("wireandpipe_detection_cpp");
     if (yolo_model_path.empty()) {
-        yolo_model_path = ament_index_cpp::get_package_share_directory("wireandpipe_detection_cpp")
-                        + "/wire_pipe_det.onnx";
+        yolo_model_path = pkg_share + "/only_pipe_det.onnx";
+    } else if (!std::filesystem::path(yolo_model_path).is_absolute()) {
+        // 允许在参数里只写模型文件名，自动补全为包 share 目录下的路径
+        yolo_model_path = pkg_share + "/" + yolo_model_path;
     }
-    yolo_ = std::make_shared<OrtObbYoloTracker>(yolo_model_path, this->get_logger(), 2);
+    yolo_ = std::make_shared<OrtObbYoloTracker>(yolo_model_path, this->get_logger());
 
     // ---- callback groups ----
     global_plan_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -339,6 +403,8 @@ WireAndPipeDetectionNode::WireAndPipeDetectionNode()
         "/raw_path/markers", 10);
     pub_wire_pipe_3d_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
         "/wire_pipe/markers_3d", 10);
+    pub_debug_map_markers_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
+        "/wireandpipe/debug_map_markers", 10);
 
     // ---- 订阅者 ----
     const std::string camera_topic = this->get_parameter("camera_topic").as_string();
@@ -417,7 +483,7 @@ cv::Mat WireAndPipeDetectionNode::decodeCompressedImage(
 
 // ---------------------------------------------------------------------------
 // 利用激光雷达测距 + 激光坐标系下3D定位
-// 和行人避让代码逻辑一致：OBB像素范围→角度→二分查找激光点→极坐标→笛卡尔坐标
+// OBB像素范围→角度→二分查找激光点→极坐标→笛卡尔坐标
 // ---------------------------------------------------------------------------
 geometry_msgs::msg::Point WireAndPipeDetectionNode::estimate3DFromLaser(
     const ObbBBox &obb,
@@ -578,7 +644,7 @@ void WireAndPipeDetectionNode::imageCallback(
             const auto now_time = this->now();
             const double elapsed = (now_time - last_waiting_log_time_).seconds();
             if (elapsed >= 10.0) {
-                RCLCPP_INFO(this->get_logger(), "Waiting to detect wire/water_pipe...");
+                RCLCPP_INFO(this->get_logger(), "Waiting to detect %s...", detection_label_.c_str());
                 waiting_detect_log_printed_ = true;
                 last_waiting_log_time_ = now_time;
             }
@@ -586,7 +652,7 @@ void WireAndPipeDetectionNode::imageCallback(
     } else {
         waiting_detect_log_printed_ = false;
         if (!first_obstacle_detected_logged_) {
-            RCLCPP_INFO(this->get_logger(), "Wire/Water pipe detected for the first time");
+            RCLCPP_INFO(this->get_logger(), "%s detected for the first time", detection_label_.c_str());
             first_obstacle_detected_logged_ = true;
         }
     }
@@ -610,10 +676,41 @@ void WireAndPipeDetectionNode::imageCallback(
         geometry_msgs::msg::Point pt_laser = estimate3DFromLaser(
             det.bbox, frame.cols, dist_laser, laser_frame_id);
 
-        // 打印距离（2 秒一次，防刷屏）
-        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-            "[distance] laser=%.2fm",
-            std::isfinite(dist_laser) ? dist_laser : -1.0f);
+        // 计算障碍物到全局/局部路径的最短距离（调试用）
+        float dist_to_global = std::numeric_limits<float>::quiet_NaN();
+        float dist_to_local  = std::numeric_limits<float>::quiet_NaN();
+        if (!laser_frame_id.empty()) {
+            geometry_msgs::msg::PointStamped p_in;
+            p_in.header.frame_id = laser_frame_id;
+            p_in.header.stamp = rclcpp::Time(0, 0, RCL_ROS_TIME);
+            p_in.point = pt_laser;
+            try {
+                geometry_msgs::msg::PointStamped p_map;
+                tf_buffer_->transform(p_in, p_map, "map", tf2::durationFromSec(0.05));
+
+                std::vector<geometry_msgs::msg::Point> ds_global_copy;
+                std::vector<geometry_msgs::msg::Point> ds_local_copy;
+                {
+                    std::lock_guard<std::mutex> lock(path_cache_mutex_);
+                    ds_global_copy = cached_ds_global_;
+                    ds_local_copy  = cached_ds_local_;
+                }
+
+                dist_to_global = static_cast<float>(minDistanceToPath(p_map.point, ds_global_copy));
+                dist_to_local  = static_cast<float>(minDistanceToPath(p_map.point, ds_local_copy));
+            } catch (const tf2::TransformException &e) {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                    "[TF] laser->map transform failed for distance log: %s", e.what());
+            }
+        }
+
+        // 打印距离（受参数 distance_log_throttle_sec 控制，默认 3 秒一次）
+        const int throttle_ms = static_cast<int>(distance_log_throttle_sec_ * 1000.0);
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), throttle_ms,
+            "[distance] laser=%.2fm global_path=%.2fm local_path=%.2fm",
+            std::isfinite(dist_laser) ? dist_laser : -1.0f,
+            std::isfinite(dist_to_global) ? dist_to_global : -1.0f,
+            std::isfinite(dist_to_local) ? dist_to_local : -1.0f);
 
         result.obstacles_laser.push_back(pt_laser);
         if (!result.laser_frame_id.empty() && !laser_frame_id.empty()) {
@@ -621,19 +718,25 @@ void WireAndPipeDetectionNode::imageCallback(
         }
         result.detected = true;
 
-        // 绘制 OBB（简化：画轴对齐矩形 + 角度标注）
-        const int x = std::max(0, std::min(static_cast<int>(det.bbox.cx - det.bbox.width * 0.5F), annotated.cols - 1));
-        const int y = std::max(0, std::min(static_cast<int>(det.bbox.cy - det.bbox.height * 0.5F), annotated.rows - 1));
-        const int w = std::max(1, std::min(static_cast<int>(det.bbox.width), annotated.cols - x));
-        const int h = std::max(1, std::min(static_cast<int>(det.bbox.height), annotated.rows - y));
-
+        // 绘制 OBB（旋转矩形）
         cv::Scalar color = (det.class_id == wire_class_id_)
             ? cv::Scalar(255, 0, 0)    // 电线 → 蓝色
             : cv::Scalar(0, 255, 0);   // 水管 → 绿色
-        cv::rectangle(annotated, cv::Rect(x, y, w, h), color, 2);
 
-        // 类别名
-        const std::string cls_name = (det.class_id == wire_class_id_) ? "wire" : "water_pipe";
+        std::vector<cv::Point> corners_int;
+        for (const auto &p : getObbCorners(det.bbox)) {
+            corners_int.emplace_back(
+                static_cast<int>(std::round(p.x)),
+                static_cast<int>(std::round(p.y)));
+        }
+        const cv::Point *pts = corners_int.data();
+        const int npts = static_cast<int>(corners_int.size());
+        cv::polylines(annotated, &pts, &npts, 1, true, color, 2);
+
+        // 类别名（从参数 class_names 读取，兼容任意类别数）
+        const std::string cls_name = (det.class_id >= 0 && det.class_id < static_cast<int>(class_names_.size()))
+            ? class_names_[det.class_id]
+            : ("class_" + std::to_string(det.class_id));
 
         std::ostringstream line1;
         line1 << cls_name << " conf:" << std::fixed << std::setprecision(2) << det.confidence;
@@ -653,13 +756,14 @@ void WireAndPipeDetectionNode::imageCallback(
         const int thickness = 2;
         const int font = cv::FONT_HERSHEY_SIMPLEX;
         const int line_gap = 20;
-        const int text_y = std::max(20, y - 5);
+        const int text_x = std::max(0, static_cast<int>(det.bbox.cx - det.bbox.width * 0.5F));
+        const int text_y = std::max(20, static_cast<int>(det.bbox.cy - det.bbox.height * 0.5F - 5));
 
-        cv::putText(annotated, line1.str(), cv::Point(x, text_y),
-                    font, font_scale, cv::Scalar(0, 255, 0), thickness);
-        cv::putText(annotated, line2.str(), cv::Point(x, text_y + line_gap),
+        cv::putText(annotated, line1.str(), cv::Point(text_x, text_y),
+                    font, font_scale, color, thickness);
+        cv::putText(annotated, line2.str(), cv::Point(text_x, text_y + line_gap),
                     font, font_scale, cv::Scalar(0, 255, 255), thickness);
-        cv::putText(annotated, line3.str(), cv::Point(x, text_y + line_gap * 2),
+        cv::putText(annotated, line3.str(), cv::Point(text_x, text_y + line_gap * 2),
                     font, font_scale, cv::Scalar(255, 165, 0), thickness);
     }
 
@@ -912,7 +1016,10 @@ void WireAndPipeDetectionNode::timerCallback()
             for (const auto &pose_stamped : last_global_plan_->poses) {
                 global_points.push_back(pose_stamped.pose.position);
             }
-            cached_ds_global_ = downsamplePath(global_points, threshold, global_search_distance_);
+            {
+                std::lock_guard<std::mutex> lock(path_cache_mutex_);
+                cached_ds_global_ = downsamplePath(global_points, threshold, global_search_distance_);
+            }
             global_plan_dirty_ = false;
         }
         if (local_poses_dirty_ && has_local_path) {
@@ -921,7 +1028,10 @@ void WireAndPipeDetectionNode::timerCallback()
             for (const auto &pose : last_local_poses_->poses) {
                 local_points.push_back(pose.position);
             }
-            cached_ds_local_ = downsamplePath(local_points, threshold, local_search_distance_);
+            {
+                std::lock_guard<std::mutex> lock(path_cache_mutex_);
+                cached_ds_local_ = downsamplePath(local_points, threshold, local_search_distance_);
+            }
             local_poses_dirty_ = false;
         }
 
@@ -1034,6 +1144,74 @@ void WireAndPipeDetectionNode::timerCallback()
                 }
                 if (pub_obstacle_markers_) pub_obstacle_markers_->publish(marker_array);
 
+                // 发布 map 坐标系下的调试可视化（路径点 + 障碍物框）
+                if (pub_debug_map_markers_) {
+                    visualization_msgs::msg::MarkerArray debug_markers;
+
+                    visualization_msgs::msg::Marker del_debug;
+                    del_debug.header.frame_id = "map";
+                    del_debug.header.stamp = now_stamp;
+                    del_debug.ns = "wireandpipe_debug";
+                    del_debug.id = 0;
+                    del_debug.action = visualization_msgs::msg::Marker::DELETEALL;
+                    debug_markers.markers.push_back(del_debug);
+
+                    int debug_id = 1;
+
+                    // 全局路径点（蓝色小球）
+                    for (const auto &pt : ds_global) {
+                        visualization_msgs::msg::Marker m;
+                        m.header.frame_id = "map";
+                        m.header.stamp = now_stamp;
+                        m.ns = "wireandpipe_debug";
+                        m.id = debug_id++;
+                        m.type = visualization_msgs::msg::Marker::SPHERE;
+                        m.action = visualization_msgs::msg::Marker::ADD;
+                        m.pose.position = pt;
+                        m.pose.position.z = 0.05;
+                        m.pose.orientation.w = 1.0;
+                        m.scale.x = 0.12; m.scale.y = 0.12; m.scale.z = 0.12;
+                        m.color.r = 0.0F; m.color.g = 0.0F; m.color.b = 1.0F; m.color.a = 0.8F;
+                        debug_markers.markers.push_back(m);
+                    }
+
+                    // 局部路径点（黄色小球）
+                    for (const auto &pt : ds_local) {
+                        visualization_msgs::msg::Marker m;
+                        m.header.frame_id = "map";
+                        m.header.stamp = now_stamp;
+                        m.ns = "wireandpipe_debug";
+                        m.id = debug_id++;
+                        m.type = visualization_msgs::msg::Marker::SPHERE;
+                        m.action = visualization_msgs::msg::Marker::ADD;
+                        m.pose.position = pt;
+                        m.pose.position.z = 0.05;
+                        m.pose.orientation.w = 1.0;
+                        m.scale.x = 0.12; m.scale.y = 0.12; m.scale.z = 0.12;
+                        m.color.r = 1.0F; m.color.g = 1.0F; m.color.b = 0.0F; m.color.a = 0.8F;
+                        debug_markers.markers.push_back(m);
+                    }
+
+                    // 障碍物（红色扁平方块，像俯视的框）
+                    for (const auto &p : obstacles_map) {
+                        visualization_msgs::msg::Marker m;
+                        m.header.frame_id = "map";
+                        m.header.stamp = now_stamp;
+                        m.ns = "wireandpipe_debug";
+                        m.id = debug_id++;
+                        m.type = visualization_msgs::msg::Marker::CUBE;
+                        m.action = visualization_msgs::msg::Marker::ADD;
+                        m.pose.position = p.point;
+                        m.pose.position.z = 0.05;
+                        m.pose.orientation.w = 1.0;
+                        m.scale.x = 0.30; m.scale.y = 0.30; m.scale.z = 0.05;
+                        m.color.r = 1.0F; m.color.g = 0.0F; m.color.b = 0.0F; m.color.a = 0.8F;
+                        debug_markers.markers.push_back(m);
+                    }
+
+                    pub_debug_map_markers_->publish(debug_markers);
+                }
+
                 // 判断是否在路径上
                 timer_on_global = has_global_path && !ds_global.empty()
                     ? checkObstacleOnGlobalPath(obstacles_map, ds_global, threshold, &timer_global_hit_dist)
@@ -1080,14 +1258,16 @@ void WireAndPipeDetectionNode::timerCallback()
         out.data = true;
         pub_avoiding_->publish(out);
         ++warning_event_id_;
-        RCLCPP_WARN(this->get_logger(), "Wire/Pipe obstacle warning, id: %llu",
+        RCLCPP_WARN(this->get_logger(), "%s obstacle warning, id: %llu",
+            detection_label_.c_str(),
             static_cast<unsigned long long>(warning_event_id_));
         last_published_avoiding_ = true;
     } else if (!is_avoiding && last_published_avoiding_) {
         auto out = std_msgs::msg::Bool();
         out.data = false;
         pub_avoiding_->publish(out);
-        RCLCPP_INFO(this->get_logger(), "Wire/Pipe obstacle warning cleared, id: %llu",
+        RCLCPP_INFO(this->get_logger(), "%s obstacle warning cleared, id: %llu",
+            detection_label_.c_str(),
             static_cast<unsigned long long>(warning_event_id_));
         last_published_avoiding_ = false;
     }
@@ -1207,6 +1387,28 @@ bool WireAndPipeDetectionNode::checkObstacleOnLocalPath(
         last_local_match_ = false;
     }
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// 计算点到路径的最短欧氏距离（用于调试日志）
+// ---------------------------------------------------------------------------
+double WireAndPipeDetectionNode::minDistanceToPath(
+    const geometry_msgs::msg::Point &point,
+    const std::vector<geometry_msgs::msg::Point> &path) const
+{
+    if (path.empty()) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    double min_dist_sq = std::numeric_limits<double>::max();
+    for (const auto &p : path) {
+        const double dx = point.x - p.x;
+        const double dy = point.y - p.y;
+        const double dist_sq = dx * dx + dy * dy;
+        if (dist_sq < min_dist_sq) {
+            min_dist_sq = dist_sq;
+        }
+    }
+    return std::sqrt(min_dist_sq);
 }
 
 // ---------------------------------------------------------------------------

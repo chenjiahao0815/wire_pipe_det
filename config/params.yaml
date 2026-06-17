@@ -23,23 +23,26 @@
     camera_roll: 0.0
 
     # --- YOLO 模型配置 ---
-    # 模型路径（留空则自动从包 share 目录查找 wire_pipe_det.onnx）
-    yolo_model_path: ""        # 留空 → 自动找 <share>/wire_pipe_det.onnx
+    # 模型路径（留空则自动从包 share 目录查找 only_pipe_det.onnx）
+    # 写相对文件名时也会自动补全为 <share>/<文件名>
+    yolo_model_path: "only_pipe_det.onnx"
 
     # YOLOv11 OBB ONNX 输出格式（ultralytics 默认导出 imgsz=640 simplify opset=12）:
-    #   [1, 7, 8400]
-    #   每列: cx, cy, w, h, angle(rad), obj_conf, cls_logit
-    #   类别解码: sigmoid(cls_logit) < 0.5 → wire, >= 0.5 → water_pipe
-    # 代码同时兼容旧式 per-class 格式 [1, 8, 8400]，自动检测通道数。
+    #   当前模型 only_pipe_det 为单类别，输出 [1, 6, 8400]
+    #   每列: cx, cy, w, h, class_score, angle(rad)
+    #   原双类别模型 wire_pipe_det 输出 [1, 7, 8400]：
+    #     每列: cx, cy, w, h, angle(rad), obj_conf, cls_logit
+    # 代码会自动检测通道数并解析。
     obb_angle_is_radians: true # 角度单位：true = 弧度, false = 度
     obb_format_xywh: true      # true = [cx, cy, w, h, angle, ...], false = [x1, y1, x2, y2, angle, ...]
 
-    # 类别
-    class_names: ["wire", "water_pipe"]
-    wire_class_id: 0
-    water_pipe_class_id: 1
+    # 类别（当前单类别模型仅使用 class_id=0，显示为 pipe / 绿色）
+    class_names: ["pipe"]
+    wire_class_id: -1          # -1 表示当前模型没有 wire 类别
+    water_pipe_class_id: 0     # class_id=0 统一按水管（绿色）显示
 
     conf_threshold: 0.5        # 检测置信度阈值
+    distance_log_throttle_sec: 3.0  # [distance] 激光日志最小间隔（秒）
 
     # --- 路径话题配置 ---
     global_plan_topic: "teb_global_plan"
@@ -65,3 +68,4 @@
 
     # --- 可视化 ---
     publish_annotated_image: true
+    publish_debug_map_markers: true

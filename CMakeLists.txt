@@ -68,7 +68,7 @@ install(FILES config/params.yaml
   DESTINATION share/${PROJECT_NAME}/config
 )
 
-install(FILES src/wire_pipe_det.onnx
+install(FILES src/wire_pipe_det.onnx src/only_pipe_det.onnx
   DESTINATION share/${PROJECT_NAME}
 )
 

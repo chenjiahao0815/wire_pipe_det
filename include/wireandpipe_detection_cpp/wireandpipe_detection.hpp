@@ -95,6 +95,10 @@ private:
         double threshold,
         double *hit_distance = nullptr);
 
+    double minDistanceToPath(
+        const geometry_msgs::msg::Point &point,
+        const std::vector<geometry_msgs::msg::Point> &path) const;
+
     // =========================================================================
     // 激光雷达测距 + 3D定位
     // OBB 像素范围 → 水平角度 → 二分查找激光点 → 极坐标转笛卡尔坐标
@@ -126,6 +130,7 @@ private:
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_downsampled_path_markers_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_raw_path_markers_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_wire_pipe_3d_;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_debug_map_markers_;
 
     // ---- TF ----
     std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
@@ -159,7 +164,10 @@ private:
 
     // YOLO
     std::string yolo_model_path_;
+    std::vector<std::string> class_names_;
+    std::string detection_label_;  // 用于日志，例如 "pipe" 或 "wire/water_pipe"
     double conf_threshold_{0.5};
+    double distance_log_throttle_sec_{3.0};
     int wire_class_id_{0};
     int water_pipe_class_id_{1};
 
@@ -176,6 +184,7 @@ private:
 
     // 可视化
     bool publish_annotated_image_{true};
+    bool publish_debug_map_markers_{true};
 
     // ---- 状态 ----
     bool has_recent_detection_{false};
@@ -189,6 +198,7 @@ private:
     bool local_poses_dirty_{false};
     std::vector<geometry_msgs::msg::Point> cached_ds_global_;
     std::vector<geometry_msgs::msg::Point> cached_ds_local_;
+    mutable std::mutex path_cache_mutex_;
 
     std::shared_ptr<ObbYoloTracker> yolo_;
 

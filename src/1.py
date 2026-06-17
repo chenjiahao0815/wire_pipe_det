@@ -19,12 +19,16 @@ import time
 import math
 import numpy as np
 
+# ---- 调试开关 ----
+# 改成 True 即可保存 C++ 节点发布的标注图像到 annotated_wire_pipe.jpg
+SAVE_ANNOTATED_IMAGE = False
+
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 
 from std_msgs.msg import Bool
-from sensor_msgs.msg import CompressedImage, LaserScan
+from sensor_msgs.msg import CompressedImage, Image, LaserScan
 from nav_msgs.msg import Path
 from geometry_msgs.msg import PoseArray, Pose, PoseStamped, TransformStamped
 from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
@@ -83,6 +87,13 @@ class WirePipeTestNode(Node):
         self.sub_avoiding = self.create_subscription(
             Bool, '/is_pipes_and_wires_in_path', self.avoiding_callback, qos_transient)
         self.warning_received = False
+
+        # ---- Subscriber: 保存 C++ 节点发布的标注图像（调试用） ----
+        self.save_annotated = SAVE_ANNOTATED_IMAGE
+        if self.save_annotated:
+            self.sub_annotated = self.create_subscription(
+                Image, '/rgb_camera_front/annotated_image_wire', self.annotated_callback, 5)
+        self.annotated_saved = False
 
         # ---- Timer: 10Hz 循环发布 ----
         self.timer = self.create_timer(0.1, self.timer_callback)
@@ -227,6 +238,21 @@ class WirePipeTestNode(Node):
                 '>>> ALERT CLEARED: /is_pipes_and_wires_in_path = False <<<')
             self.warning_received = False
 
+    def annotated_callback(self, msg: Image):
+        """把节点发布的标注图存下来，方便查看检测框和激光测距结果"""
+        if not SAVE_ANNOTATED_IMAGE or self.annotated_saved:
+            return
+        if msg.encoding != 'bgr8':
+            return
+        try:
+            img = np.frombuffer(msg.data, dtype=np.uint8).reshape((msg.height, msg.width, 3))
+            out_path = 'annotated_wire_pipe.jpg'
+            cv2.imwrite(out_path, img)
+            self.get_logger().info(f'Saved annotated image to: {out_path}')
+            self.annotated_saved = True
+        except Exception as e:
+            self.get_logger().warn(f'Failed to save annotated image: {e}')
+
 
 def find_image():
     """在当前目录找一张图片"""
@@ -248,7 +274,7 @@ def main():
         image_path = find_image()
         if image_path is None:
             print('ERROR: No image found in current directory.')
-            print('Usage: python3 test_wireandpipe_sim.py [image_path]')
+            print('Usage: python3 1.py [image_path]')
             print('  Supported formats: png, jpg, jpeg')
             rclpy.shutdown()
             return
