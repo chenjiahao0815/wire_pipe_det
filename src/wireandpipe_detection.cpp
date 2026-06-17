@@ -644,16 +644,13 @@ void WireAndPipeDetectionNode::imageCallback(
     }
 
     if (obstacle_count == 0) {
+        // 没有检测到目标时只打印一次，直到下一次“检测到→再消失”才重置
         if (!waiting_detect_log_printed_) {
-            const auto now_time = this->now();
-            const double elapsed = (now_time - last_waiting_log_time_).seconds();
-            if (elapsed >= 10.0) {
-                RCLCPP_INFO(this->get_logger(), "Waiting to detect %s...", detection_label_.c_str());
-                waiting_detect_log_printed_ = true;
-                last_waiting_log_time_ = now_time;
-            }
+            RCLCPP_INFO(this->get_logger(), "Waiting to detect %s...", detection_label_.c_str());
+            waiting_detect_log_printed_ = true;
         }
     } else {
+        // 检测到目标时重置 waiting 标志，这样目标消失后可以再次打印一次 waiting 日志
         waiting_detect_log_printed_ = false;
         if (!first_obstacle_detected_logged_) {
             RCLCPP_INFO(this->get_logger(), "%s detected for the first time", detection_label_.c_str());

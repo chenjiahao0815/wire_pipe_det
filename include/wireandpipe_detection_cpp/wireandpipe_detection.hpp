@@ -229,7 +229,6 @@ private:
     // 日志去重
     bool waiting_detect_log_printed_{false};
     bool first_obstacle_detected_logged_{false};
-    rclcpp::Time last_waiting_log_time_{0, 0, RCL_ROS_TIME};
 
     // timer 用于只在状态变化时打印日志
     bool last_trigger_state_{false};
